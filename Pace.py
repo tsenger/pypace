@@ -9,6 +9,10 @@ from binascii import unhexlify, hexlify
 from ecdsa.ellipticcurve import Point, CurveFp
 from ecdsa.curves import Curve
 
+#pip install pytlv
+from pytlv.TLV import *
+
+import binascii
 import logging
 
 
@@ -77,8 +81,8 @@ class Pace:
     
     
     def __getX1(self):
-        self.PCD_SK_x1 = self.__hex_to_int(bytearray(get_random_bytes(32)))
-        PCD_PK_X1 = self.pointG * self.PCD_SK_x1
+        self.__PCD_SK_x1 = self.__hex_to_int(bytearray(get_random_bytes(32)))
+        PCD_PK_X1 = self.pointG * self.__PCD_SK_x1
         return bytearray(bytearray([0x04])+self.__long_to_bytearray(PCD_PK_X1.x())+ self.__long_to_bytearray(PCD_PK_X1.y()))
     
     
@@ -87,16 +91,19 @@ class Pace:
         y = PICC_PK[33:]
         
         pointY1 = Point( self.curve_brainpoolp256r1, self.__hex_to_int(x), self.__hex_to_int(y), self._q)
-        sharedSecret_P = pointY1 * self.PCD_SK_x1
+        sharedSecret_P = pointY1 * self.__PCD_SK_x1
         pointG_strich = (self.pointG * self.__hex_to_int(decryptedNonce)) + sharedSecret_P
         
-        self.PCD_SK_x2 = self.__hex_to_int(bytearray(get_random_bytes(32)))
-        PCD_PK_X2 = pointG_strich * self.PCD_SK_x2
+        self.__PCD_SK_x2 = self.__hex_to_int(bytearray(get_random_bytes(32)))
+        PCD_PK_X2 = pointG_strich * self.__PCD_SK_x2
         return bytearray(bytearray([0x04])+self.__long_to_bytearray(PCD_PK_X2.x())+ self.__long_to_bytearray(PCD_PK_X2.y()))
     
     
-    def __sendMSESetAt(self, pace_oid, pw_ref):
-        apdu_mse = [0x00, 0x22, 0xc1, 0xa4, len(pace_oid)+5, 0x80, len(pace_oid)] + pace_oid + [0x83, 0x01, pw_ref]
+    def __sendMSESetAt(self, pace_oid, pw_ref, chat = None):
+        if (chat is None):
+            apdu_mse = [0x00, 0x22, 0xc1, 0xa4, len(pace_oid)+5, 0x80, len(pace_oid)] + pace_oid + [0x83, 0x01, pw_ref]
+        else:
+            apdu_mse = [0x00, 0x22, 0xc1, 0xa4, len(pace_oid)+8+len(chat), 0x80, len(pace_oid)] + pace_oid + [0x83, 0x01, pw_ref] + [0x7F, 0x4C, len(chat)] + chat
         self.__transceiveAPDU(apdu_mse)
     
     
@@ -120,13 +127,17 @@ class Pace:
     def __sendGA4(self, authToken):
         header = bytearray([0x00, 0x86, 0, 0, len(authToken)+4, 0x7c, len(authToken)+2, 0x85, len(authToken)])
         response = self.__transceiveAPDU(list(header + authToken)+[0])
-        return bytearray(response[4:])
+        
+        tlv = TLV(['86', '87', '88'])
+        collection = tlv.parse(binascii.hexlify(response[2:])) 
+        
+        return bytearray.fromhex(collection.get('86')), bytearray.fromhex(collection.get('87')), bytearray.fromhex(collection.get('88'))
     
     def __getSharedSecret(self, PICC_PK):
         x = PICC_PK[1:33]
         y = PICC_PK[33:]
         pointY2 = Point( self.curve_brainpoolp256r1, self.__hex_to_int(x), self.__hex_to_int(y), self._q)
-        K = pointY2 * self.PCD_SK_x2
+        K = pointY2 * self.__PCD_SK_x2
         return self.__long_to_bytearray(K.x())
     
     
@@ -154,10 +165,9 @@ class Pace:
         
         self.curve_brainpoolp256r1 = CurveFp( _p, _a, _b)
         self.pointG = Point(self.curve_brainpoolp256r1, _Gx, _Gy, self._q)
-        #self.BRAINPOOLP256r1= Curve("BRAINPOOLP256r1", self.curve_brainpoolp256r1, self.pointG, (1, 3, 36, 3, 3, 2, 8, 1, 1, 7), "brainpoolP256r1")
     
-    def performPACE(self, password, pw_ref, algorithm_oid):
-        self.__sendMSESetAt(algorithm_oid, pw_ref)
+    def performPACE(self, algorithm_oid, password, pw_ref, chat = None):
+        self.__sendMSESetAt(algorithm_oid, pw_ref, chat)
         
         encryptedNonce = self.__sendGA1()
         logging.info("PACE encrypted nonce: " + toHexString(list(encryptedNonce)))
@@ -186,8 +196,9 @@ class Pace:
         tpcd = self.__calcAuthToken(kmac, algorithm_oid, PICC_PK_Y2)
         logging.info("PACE tpcd: "+toHexString(list(tpcd)))
     
-        tpicc = self.__sendGA4(tpcd)
+        tpicc, car1, car2 = self.__sendGA4(tpcd)
         logging.info("PACE tpicc: "+toHexString(list(tpicc)))
+        logging.info("CAR1: "+ car1 +", CAR2: " + car2)
         
         tpicc_strich = self.__calcAuthToken(kmac, algorithm_oid, PCD_PK_X2);
         
