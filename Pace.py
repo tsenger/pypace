@@ -1,11 +1,9 @@
 from smartcard.util import toHexString
 
 # needs pycryptodome (pip install pycryptodomex)
-from Crypto.Cipher import AES
-from Crypto.Hash import CMAC, SHA
 from Crypto.Random import get_random_bytes
 
-from binascii import unhexlify, hexlify
+from binascii import hexlify
 from ecdsa.ellipticcurve import Point, CurveFp
 from ecdsa.curves import Curve
 
@@ -14,6 +12,8 @@ from pytlv.TLV import *
 
 import binascii
 import logging
+import utils
+from PyPaceCrypto import PyPaceCrypto
 
 
 class Pace:
@@ -22,40 +22,7 @@ class Pace:
         logging.getLogger()
         self.__load_brainpool()
         self.connection = connection
-
-    def __long_to_bytearray (self, val, endianness='big'):
-        """
-        Use :ref:`string formatting` and :func:`~binascii.unhexlify` to
-        convert ``val``, a :func:`long`, to a byte :func:`str`.
-    
-        :param long val: The value to pack
-    
-        :param str endianness: The endianness of the result. ``'big'`` for
-          big-endian, ``'little'`` for little-endian.
-        """
-    
-        # one (1) hex digit per four (4) bits
-        width = val.bit_length()
-    
-        # unhexlify wants an even multiple of eight (8) bits, but we don't
-        # want more digits than we need (hence the ternary-ish 'or')
-        width += 8 - ((width % 8) or 8)
-    
-        # format width specifier: four (4) bits per hex digit
-        fmt = '%%0%dx' % (width // 4)
-    
-        # prepend zero (0) to the width, to zero-pad the output
-        s = unhexlify(fmt % val)
-    
-        if endianness == 'little':
-            # see http://stackoverflow.com/a/931095/309233
-            s = s[::-1]
-    
-        return bytearray(s)
-    
-    
-    def __hex_to_int(self, b):
-        return int(hexlify(b), 16)
+        self.crypto = PyPaceCrypto()
 
     
     def __transceiveAPDU(self, command):
@@ -66,37 +33,23 @@ class Pace:
         return bytearray(data)
     
     
-    def __kdf(self, password, c):
-        intarray = [0, 0, 0 , c]
-        mergedData = list(bytearray(password)) + intarray
-        sha = SHA.new()
-        sha.update(bytearray(mergedData))
-        return bytearray(sha.digest())[0:16]
-    
-    
-    def __decryptNonce(self, encryptedNonce, password):
-        derivatedPassword = self.__kdf(password, 3)
-        aes = AES.new(str(derivatedPassword), AES.MODE_ECB)
-        return bytearray(aes.decrypt(str(encryptedNonce)))
-    
-    
     def __getX1(self):
-        self.__PCD_SK_x1 = self.__hex_to_int(bytearray(get_random_bytes(32)))
+        self.__PCD_SK_x1 = utils.hex_to_int(bytearray(get_random_bytes(32)))
         PCD_PK_X1 = self.pointG * self.__PCD_SK_x1
-        return bytearray(bytearray([0x04])+self.__long_to_bytearray(PCD_PK_X1.x())+ self.__long_to_bytearray(PCD_PK_X1.y()))
+        return bytearray(bytearray([0x04])+utils.long_to_bytearray(PCD_PK_X1.x())+ utils.long_to_bytearray(PCD_PK_X1.y()))
     
     
     def __getX2(self, PICC_PK, decryptedNonce):
         x = PICC_PK[1:33]
         y = PICC_PK[33:]
         
-        pointY1 = Point( self.curve_brainpoolp256r1, self.__hex_to_int(x), self.__hex_to_int(y), self._q)
+        pointY1 = Point( self.curve_brainpoolp256r1, utils.hex_to_int(x), utils.hex_to_int(y), self._q)
         sharedSecret_P = pointY1 * self.__PCD_SK_x1
-        pointG_strich = (self.pointG * self.__hex_to_int(decryptedNonce)) + sharedSecret_P
+        pointG_strich = (self.pointG * utils.hex_to_int(decryptedNonce)) + sharedSecret_P
         
-        self.__PCD_SK_x2 = self.__hex_to_int(bytearray(get_random_bytes(32)))
+        self.__PCD_SK_x2 = utils.hex_to_int(bytearray(get_random_bytes(32)))
         PCD_PK_X2 = pointG_strich * self.__PCD_SK_x2
-        return bytearray(bytearray([0x04])+self.__long_to_bytearray(PCD_PK_X2.x())+ self.__long_to_bytearray(PCD_PK_X2.y()))
+        return bytearray(bytearray([0x04])+utils.long_to_bytearray(PCD_PK_X2.x())+ utils.long_to_bytearray(PCD_PK_X2.y()))
     
     
     def __sendMSESetAt(self, pace_oid, pw_ref, chat = None):
@@ -128,30 +81,41 @@ class Pace:
         header = bytearray([0x00, 0x86, 0, 0, len(authToken)+4, 0x7c, len(authToken)+2, 0x85, len(authToken)])
         response = self.__transceiveAPDU(list(header + authToken)+[0])
         
-        tlv = TLV(['86', '87', '88'])
+        tlv = TLV(['86', '87', '88']) # DO87 and DO88 are optional
+        
         collection = tlv.parse(binascii.hexlify(response[2:])) 
         
-        return bytearray.fromhex(collection.get('86')), bytearray.fromhex(collection.get('87')), bytearray.fromhex(collection.get('88'))
+        if (collection.get('86') != None):
+            DO86 = bytearray.fromhex(collection.get('86'))
+        else:
+            DO86 = None
+        
+        if (collection.get('87') != None):
+            DO87 = bytearray.fromhex(collection.get('87'))
+        else:
+            DO87 = None
+       
+        if (collection.get('88') != None):
+            DO88 = bytearray.fromhex(collection.get('88'))
+        else:
+            DO88 = None
+
+        return DO86, DO87, DO88
+
     
     def __getSharedSecret(self, PICC_PK):
         x = PICC_PK[1:33]
         y = PICC_PK[33:]
-        pointY2 = Point( self.curve_brainpoolp256r1, self.__hex_to_int(x), self.__hex_to_int(y), self._q)
+        pointY2 = Point( self.curve_brainpoolp256r1, utils.hex_to_int(x), utils.hex_to_int(y), self._q)
         K = pointY2 * self.__PCD_SK_x2
-        return self.__long_to_bytearray(K.x())
+        return utils.long_to_bytearray(K.x())
     
     
     def __calcAuthToken(self, kmac, algorithm_oid, Y2):
         oid_input = [0x06, len(algorithm_oid)] +algorithm_oid
         mac_input = [0x7f, 0x49, len(oid_input)+len(Y2)+2] + oid_input + [0x86, len(Y2)] + list(Y2)
         logging.debug("Mac input: " + toHexString(mac_input))
-        return bytearray(self.__getCMAC(kmac, bytearray(mac_input)))[:8]
-    
-    
-    def __getCMAC(self, key, data):
-        cmac = CMAC.new(str(key), ciphermod=AES)
-        cmac.update(str(data))
-        return bytearray(cmac.digest())
+        return bytearray(self.crypto.getCMAC(kmac, bytearray(mac_input)))[:8]
     
     
     def __load_brainpool(self):
@@ -171,7 +135,8 @@ class Pace:
         
         encryptedNonce = self.__sendGA1()
         logging.info("PACE encrypted nonce: " + toHexString(list(encryptedNonce)))
-        decryptedNonce = self.__decryptNonce(encryptedNonce, password)
+        #decryptedNonce = self.__decryptNonce(encryptedNonce, password)
+        decryptedNonce = self.crypto.decryptBlock(self.crypto.kdf(password, 3), encryptedNonce)
         logging.info("PACE decrypted nonce: " + toHexString(list(decryptedNonce)))
     
         PCD_PK_X1 = self.__getX1()
@@ -187,10 +152,10 @@ class Pace:
         sharedSecretK = self.__getSharedSecret(PICC_PK_Y2)
         logging.info("PACE Shared Secret K: "+toHexString(list(sharedSecretK)))
         
-        kenc = self.__kdf(sharedSecretK, 1)
+        kenc = self.crypto.kdf(sharedSecretK, 1)
         logging.info("PACE K_enc: "+toHexString(list(kenc)))
         
-        kmac = self.__kdf(sharedSecretK, 2)
+        kmac = self.crypto.kdf(sharedSecretK, 2)
         logging.info("PACE K_mac: "+toHexString(list(kmac)))
         
         tpcd = self.__calcAuthToken(kmac, algorithm_oid, PICC_PK_Y2)
@@ -198,7 +163,10 @@ class Pace:
     
         tpicc, car1, car2 = self.__sendGA4(tpcd)
         logging.info("PACE tpicc: "+toHexString(list(tpicc)))
-        logging.info("CAR1: "+ car1 +", CAR2: " + car2)
+        if (car1 != None):
+            logging.info("CAR1: "+ car1)
+        if (car2 != None):
+            logging.info("CAR2: "+ car2)
         
         tpicc_strich = self.__calcAuthToken(kmac, algorithm_oid, PCD_PK_X2);
         
